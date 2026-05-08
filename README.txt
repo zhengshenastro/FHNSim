@@ -93,15 +93,13 @@ You need:
 - Windows 11 (recommended)
 - WSL2 enabled
 - Ubuntu installed through WSL
-- NVIDIA driver with WSL CUDA support
+- NVIDIA driver with WSL CUDA support INSTALLED ON WIN NOT ON LINUX
 
 Inside WSL:
 
-nvidia-smi
+Nvidia-smi may not correctly detect the GPU, this doesn't matter
 
-should correctly detect the GPU.
-
-Then install the CUDA-enabled JAX build inside the WSL Python environment.
+Then install the dependencies EXACTLY according to requirements.txt to a virtual env on wsl.
 
 --------------------------------------------------
 

@@ -1,4 +1,5 @@
-# JAX Acceleration Backend
+# This project is modified from https://github.com/RJ-9H/FHN-Projecy/tree/main
+# With JAX Acceleration Backend
 
 This project supports three execution backends:
 

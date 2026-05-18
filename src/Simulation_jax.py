@@ -1,66 +1,54 @@
-
 """
-Simulation_jax.py
------------------
-FHN reaction–diffusion simulation on a 2D periodic domain (torus), using Fourier pseudo-spectral methods.
+FHNSimulation_grid2d_jax.py
+---------------------------
+JAX-optimised 2D pseudo-spectral simulation of the FitzHugh–Nagumo (FHN) system
+on a rectangular domain with **Neumann (zero-flux) boundary conditions**.
 
-This file supports two backends:
+This is the JAX analogue of:
+  - Simulation (1): model-driven ETD structure (integrating factor)
+  - Grid2D: DCT-II basis (reflecting / Neumann BCs)
 
-1) backend="numpy"
-   - Uses NumPy arrays and SciPy FFT (scipy.fft.fftn/ifftn).
+Design goals (per request)
+--------------------------
+1) Use Grid2D (Neumann) geometry: k_n = n*pi/L and DCT/IDCT transforms.
+2) Provide the richer initial conditions (init_type) from the original Simulation.py.
+3) Preserve snapshot interface compatibility:
+      u_history, v_history, t_history are NumPy arrays after run().
+4) JAX optimisation "in the style of Simulation_jax.py":
+      - JIT-compiled time loop via lax.fori_loop
+      - Preallocated history arrays
+      - float64 enabled (recommended for pattern-forming PDEs)
 
-2) backend="jax"
-   - Two JAX modes:
-     a) jax_mode="xla" (fast): uses jax.numpy.fft.* (XLA FFT on CPU/GPU).
-     b) jax_mode="scipy_callback" (Route B / deterministic matching): uses
-        SciPy FFT *inside* a JAX loop via jax.pure_callback so that the FFT
-        implementation matches the NumPy/SciPy backend as closely as possible.
+Notes / Requirements
+--------------------
+- Requires JAX installed. If not available, import will raise.
+- Uses jax.scipy.fft.dct/idct (separable 2D DCT-II).
+- Model classes are assumed to be RegularFHN or MassConservedFHN (for type check)
+  and to provide parameters a,b,epsilon,Du,Dv. We do NOT call model.build_masks()
+  nor model.spectral_update(); we compute masks and updates in JAX for speed.
 
-Why "scipy_callback"?
-- Pattern-forming PDEs can amplify tiny floating-point differences (even in float64)
-  into qualitatively different late-time patterns.
-- If you need NumPy vs JAX runs to match frame-by-frame, you must match the FFT
-  *implementation*, not just the PDE discretization.
-- This mode prioritizes reproducibility/consistency over speed.
-
-Notes
------
-- Periodic boundary conditions are enforced by construction via FFT on a torus.
-- Default dtype is float64.
-- Compatible with NumPy 2.0 (no np.array(..., copy=False) hard errors).
-
-Dependencies
-------------
-- numpy
-- scipy
-- jax (optional, only if backend="jax")
-- Torus.py providing Torus2D with k-space arrays (kx, ky, k2, k4) and spatial grids (px, py)
-- FHNmodel.py providing RegularFHN and MassConservedFHN with parameters (a,b,epsilon,Du,Dv)
+Files expected in your project
+------------------------------
+- Grid2D.py providing class Grid2D with geometry arrays:
+    sizex,sizey,resx,resy,dx,dy,px,py,k2,k4
+  (We inherit Grid2D for geometry only.)
+- FHNmodel.py providing RegularFHN and MassConservedFHN
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
-import scipy.fft as spfft
 
-from Torus import Torus2D
+import jax
+jax.config.update("jax_enable_x64", True)  # IMPORTANT: before importing jnp
+import jax.numpy as jnp
+from jax import lax
+
+from Grid2D import Grid2D
 from FHNmodel import RegularFHN, MassConservedFHN
-
-# JAX is optional
-try:
-    import jax
-    jax.config.update("jax_enable_x64", True)  # IMPORTANT: before importing jnp
-    import jax.numpy as jnp
-    from jax import lax
-    _JAX_AVAILABLE = True
-except Exception:
-    jax = None
-    jnp = None
-    lax = None
-    _JAX_AVAILABLE = False
 
 
 @dataclass(frozen=True)
@@ -73,9 +61,35 @@ class _ModelParams:
     mass_conserved: bool
 
 
-class FHNSimulation(Torus2D):
+def _dct2(x: jnp.ndarray) -> jnp.ndarray:
+    """2D DCT-II with orthonormal normalisation (separable)."""
+    # Import here to keep module import light
+    from jax.scipy.fft import dct
+    y = dct(x, type=2, norm="ortho", axis=0)
+    y = dct(y, type=2, norm="ortho", axis=1)
+    return y
+
+
+def _idct2(x_hat: jnp.ndarray) -> jnp.ndarray:
+    """Inverse of DCT-II using IDCT with matching conventions (separable)."""
+    from jax.scipy.fft import idct
+    y = idct(x_hat, type=2, norm="ortho", axis=0)
+    y = idct(y, type=2, norm="ortho", axis=1)
+    return y
+
+
+class FHNSimulation(Grid2D):
     """
-    Fourier pseudo-spectral simulation of FHN on a 2D periodic domain.
+    JAX pseudo-spectral time-stepping for the 2D FHN system with Neumann BCs.
+
+    Parameters
+    ----------
+    model       : RegularFHN or MassConservedFHN instance
+    sizex/sizey : physical domain lengths
+    resx/resy   : grid resolution (number of points)
+    dt          : time step
+    save_every  : store state every n steps
+    store_initial : store t=0 initial condition in histories
     """
 
     def __init__(
@@ -87,51 +101,31 @@ class FHNSimulation(Torus2D):
         resy: int,
         dt: float = 0.05,
         save_every: int = 20,
-        backend: str = "numpy",
-        dtype=np.float64,
-        dealias: bool = False,
-        jax_mode: str = "scipy_callback",  # "scipy_callback" (Route B) or "xla" (fast)
+        store_initial: bool = True,
     ):
         super().__init__(sizex, sizey, resx, resy)
 
         self.model = model
         self.dt = float(dt)
         self.save_every = int(save_every)
-        self.backend = str(backend).lower().strip()
-        self.dtype = dtype
-        self.dealias = bool(dealias)
-        self.jax_mode = str(jax_mode).lower().strip()
+        self.store_initial = bool(store_initial)
 
-        if self.backend not in {"numpy", "jax"}:
-            raise ValueError('backend must be "numpy" or "jax"')
-        if self.backend == "jax":
-            if not _JAX_AVAILABLE:
-                raise ImportError('backend="jax" requested but JAX could not be imported.')
-            if self.jax_mode not in {"xla", "scipy_callback"}:
-                raise ValueError('jax_mode must be "xla" or "scipy_callback"')
-
-        # Fields
+        # Fields (NumPy on host)
         self.u: Optional[np.ndarray] = None
         self.v: Optional[np.ndarray] = None
 
-        # History (NumPy)
+        # History (NumPy on host, filled after run)
         self.u_history: Optional[np.ndarray] = None
         self.v_history: Optional[np.ndarray] = None
         self.t_history: Optional[np.ndarray] = None
 
-        # NumPy spectral masks (integrating factor)
-        self.linear_mask_u: Optional[np.ndarray] = None
-        self.linear_mask_v: Optional[np.ndarray] = None
-        self._dealias_mask_np: Optional[np.ndarray] = None
+        # Cached JAX arrays
+        self._k2_j: Optional[jnp.ndarray] = None
+        self._mask_u_j: Optional[jnp.ndarray] = None
+        self._mask_v_j: Optional[jnp.ndarray] = None
+        self._mp: Optional[_ModelParams] = None
 
-        # JAX cached arrays
-        self._k2_j: Optional["jnp.ndarray"] = None
-        self._mask_u_j: Optional["jnp.ndarray"] = None
-        self._mask_v_j: Optional["jnp.ndarray"] = None
-        self._dealias_mask_j: Optional["jnp.ndarray"] = None
-
-        # Route-B callback payload
-        self._np_step_payload = None  # set in BuildSpectralMasks()
+    # ── Model params & masks ────────────────────────────────────────────────
 
     def _model_params(self) -> _ModelParams:
         m = self.model
@@ -145,115 +139,50 @@ class FHNSimulation(Torus2D):
             mass_conserved=mass_conserved,
         )
 
-    # ── Dealias masks ──────────────────────────────────────────────────────
-
-    def _build_dealias_mask_numpy_rect_23(self) -> None:
-        """Standard 2/3 rectangular rule (keeps modes with |kx| and |ky| below cutoff)."""
-        kx = self.kx
-        ky = self.ky
-        kx_max = np.max(np.abs(kx))
-        ky_max = np.max(np.abs(ky))
-        cutoff_x = (2.0 / 3.0) * kx_max
-        cutoff_y = (2.0 / 3.0) * ky_max
-        mask = (np.abs(kx) <= cutoff_x) & (np.abs(ky) <= cutoff_y)
-        self._dealias_mask_np = mask.astype(self.dtype)
-
-    # ── BuildSpectralMasks ──────────────────────────────────────────────────
-
     def BuildSpectralMasks(self) -> None:
         """
-        Build integrating-factor masks and prepare payloads for each backend.
+        Build integrating-factor masks in JAX for the linear diffusion operators.
         """
-        m = self.model
         mp = self._model_params()
+        self._mp = mp
 
-        # NumPy masks (float64 default)
-        if isinstance(m, RegularFHN):
-            self.linear_mask_u = np.exp(-mp.Du * self.k2 * self.dt).astype(self.dtype)
-            self.linear_mask_v = np.exp(-mp.Dv * self.k2 * self.dt).astype(self.dtype)
-        elif isinstance(m, MassConservedFHN):
-            self.linear_mask_u = np.exp(-mp.Du * self.k4 * self.dt).astype(self.dtype)
-            self.linear_mask_v = np.exp(-mp.Dv * self.k4 * self.dt).astype(self.dtype)
-        else:
-            raise TypeError(f"Unknown model type: {type(m)}")
+        k2 = jnp.array(self.k2, dtype=jnp.float64)
+        self._k2_j = k2
 
-        if self.dealias and (self._dealias_mask_np is None):
-            self._build_dealias_mask_numpy_rect_23()
-
-        # Payload used by Route-B SciPy callback (kept as NumPy arrays)
-        self._np_step_payload = dict(
-            a=mp.a,
-            b=mp.b,
-            epsilon=mp.epsilon,
-            dt=float(self.dt),
-            k2=np.asarray(self.k2, dtype=np.float64),
-            linear_mask_u=np.asarray(self.linear_mask_u, dtype=np.complex128),  # allow complex multiply
-            linear_mask_v=np.asarray(self.linear_mask_v, dtype=np.complex128),
-            mass_conserved=bool(mp.mass_conserved),
-            dealias_mask=(np.asarray(self._dealias_mask_np, dtype=np.complex128) if self.dealias else None),
-        )
-
-        # JAX masks (for xla mode)
-        if self.backend == "jax":
-            k2 = jnp.array(self.k2, dtype=jnp.float64)
-            self._k2_j = k2
-
-            dt = jnp.float64(self.dt)
-            Du = jnp.float64(mp.Du)
-            Dv = jnp.float64(mp.Dv)
-
-            if mp.mass_conserved:
-                k4 = k2 * k2
-                self._mask_u_j = jnp.exp(-Du * k4 * dt)
-                self._mask_v_j = jnp.exp(-Dv * k4 * dt)
-            else:
-                self._mask_u_j = jnp.exp(-Du * k2 * dt)
-                self._mask_v_j = jnp.exp(-Dv * k2 * dt)
-
-            if self.dealias:
-                self._dealias_mask_j = jnp.array(self._dealias_mask_np, dtype=jnp.float64)
-
-    # ── NumPy one-step ─────────────────────────────────────────────────────
-
-    def SpectralStep(self) -> None:
-        """One time step using NumPy + SciPy FFT (pseudo-spectral)."""
-        m = self.model
-        mp = self._model_params()
-
-        u_hat = spfft.fftn(self.u)
-        v_hat = spfft.fftn(self.v)
-
-        f_uv = self.u - (self.u ** 3) / 3.0 - self.v
-        g_uv = self.u + mp.a - mp.b * self.v
-
-        f_hat = spfft.fftn(f_uv)
-        g_hat = spfft.fftn(g_uv)
+        dt = jnp.float64(self.dt)
+        Du = jnp.float64(mp.Du)
+        Dv = jnp.float64(mp.Dv)
 
         if mp.mass_conserved:
-            u_hat_new = self.linear_mask_u * (u_hat + self.dt * (self.k2 * f_hat))
-            v_hat_new = self.linear_mask_v * (v_hat + self.dt * (mp.epsilon * self.k2 * g_hat))
+            k4 = k2 * k2
+            self._mask_u_j = jnp.exp(-Du * k4 * dt)
+            self._mask_v_j = jnp.exp(-Dv * k4 * dt)
         else:
-            u_hat_new = self.linear_mask_u * (u_hat + self.dt * f_hat)
-            v_hat_new = self.linear_mask_v * (v_hat + self.dt * (mp.epsilon * g_hat))
+            self._mask_u_j = jnp.exp(-Du * k2 * dt)
+            self._mask_v_j = jnp.exp(-Dv * k2 * dt)
 
-        if self.dealias:
-            u_hat_new = u_hat_new * self._dealias_mask_np
-            v_hat_new = v_hat_new * self._dealias_mask_np
-
-        self.u = np.real(spfft.ifftn(u_hat_new)).astype(self.dtype, copy=False)
-        self.v = np.real(spfft.ifftn(v_hat_new)).astype(self.dtype, copy=False)
-
-    # ── JAX fast step (XLA FFT) ─────────────────────────────────────────────
+    # ── One JAX step (DCT-based ETD) ────────────────────────────────────────
 
     @staticmethod
-    def _jax_step_xla(u, v, *, a, b, epsilon, dt, k2, mask_u, mask_v, mass_conserved: bool, dealias_mask):
+    def _jax_step(u, v, *, a, b, epsilon, dt, k2, mask_u, mask_v, mass_conserved: bool):
+        """
+        One ETD / integrating-factor step in DCT space.
+
+        Regular FHN:
+          û_{n+1} = mask_u * ( û_n + dt * f̂ )
+          v̂_{n+1} = mask_v * ( v̂_n + dt * ε * ĝ )
+
+        Mass-conserved FHN:
+          û_{n+1} = mask_u * ( û_n + dt * k² * f̂ )
+          v̂_{n+1} = mask_v * ( v̂_n + dt * ε * k² * ĝ )
+        """
         f_uv = u - (u ** 3) / 3.0 - v
         g_uv = u + a - b * v
 
-        u_hat = jnp.fft.fftn(u, axes=(0, 1))
-        v_hat = jnp.fft.fftn(v, axes=(0, 1))
-        f_hat = jnp.fft.fftn(f_uv, axes=(0, 1))
-        g_hat = jnp.fft.fftn(g_uv, axes=(0, 1))
+        u_hat = _dct2(u)
+        v_hat = _dct2(v)
+        f_hat = _dct2(f_uv)
+        g_hat = _dct2(g_uv)
 
         if mass_conserved:
             u_hat_new = mask_u * (u_hat + dt * k2 * f_hat)
@@ -262,235 +191,159 @@ class FHNSimulation(Torus2D):
             u_hat_new = mask_u * (u_hat + dt * f_hat)
             v_hat_new = mask_v * (v_hat + dt * epsilon * g_hat)
 
-        if dealias_mask is not None:
-            u_hat_new = u_hat_new * dealias_mask
-            v_hat_new = v_hat_new * dealias_mask
-
-        u_new = jnp.real(jnp.fft.ifftn(u_hat_new, axes=(0, 1)))
-        v_new = jnp.real(jnp.fft.ifftn(v_hat_new, axes=(0, 1)))
+        u_new = _idct2(u_hat_new)
+        v_new = _idct2(v_hat_new)
         return u_new, v_new
 
-    # ── JAX Route-B step: SciPy FFT callback ────────────────────────────────
+    # ── Initial conditions (ported) ─────────────────────────────────────────
 
-    def _np_step_scipy(self, u_np: np.ndarray, v_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def set_initial_conditions(
+        self,
+        u0: np.ndarray | None = None,
+        v0: np.ndarray | None = None,
+        seed: int = 0,
+        init_type: str = "random",
+    ) -> None:
         """
-        Host-side step using SciPy FFT, intended to match NumPy backend behavior.
+        Set initial fields.
+
+        Backwards-compatible signature:
+            set_initial_conditions(u0=None, v0=None, seed=42, init_type="random")
+
+        Supported init_type:
+            "random", "pulse", "front", "sin", "biased",
+            "spiral_cg", "spiral_bw", "spiral_pf"
         """
-        p = self._np_step_payload
-        a = p["a"]
-        b = p["b"]
-        eps = p["epsilon"]
-        dt = p["dt"]
-        k2 = p["k2"]
-        mask_u = p["linear_mask_u"]
-        mask_v = p["linear_mask_v"]
-        mass_conserved = p["mass_conserved"]
-        dealias_mask = p["dealias_mask"]
-
-        # Ensure float64 inputs on host
-        u_np = np.asarray(u_np, dtype=np.float64)
-        v_np = np.asarray(v_np, dtype=np.float64)
-
-        u_hat = spfft.fftn(u_np)
-        v_hat = spfft.fftn(v_np)
-
-        f_uv = u_np - (u_np ** 3) / 3.0 - v_np
-        g_uv = u_np + a - b * v_np
-
-        f_hat = spfft.fftn(f_uv)
-        g_hat = spfft.fftn(g_uv)
-
-        if mass_conserved:
-            u_hat_new = mask_u * (u_hat + dt * (k2 * f_hat))
-            v_hat_new = mask_v * (v_hat + dt * (eps * k2 * g_hat))
-        else:
-            u_hat_new = mask_u * (u_hat + dt * f_hat)
-            v_hat_new = mask_v * (v_hat + dt * (eps * g_hat))
-
-        if dealias_mask is not None:
-            u_hat_new = u_hat_new * dealias_mask
-            v_hat_new = v_hat_new * dealias_mask
-
-        u_new = np.real(spfft.ifftn(u_hat_new)).astype(np.float64, copy=False)
-        v_new = np.real(spfft.ifftn(v_hat_new)).astype(np.float64, copy=False)
-        return u_new, v_new
-
-    def _jax_step_scipy_callback(self, u, v):
-        """
-        JAX wrapper around _np_step_scipy using pure_callback.
-        """
-        # Output shape/dtype must be declared
-        out_spec_u = jax.ShapeDtypeStruct(u.shape, jnp.float64)
-        out_spec_v = jax.ShapeDtypeStruct(v.shape, jnp.float64)
-
-        def _cb(u_in, v_in):
-            u_out, v_out = self._np_step_scipy(u_in, v_in)
-            return (u_out, v_out)
-
-        u_new, v_new = jax.pure_callback(_cb, (out_spec_u, out_spec_v), u, v)
-        return u_new, v_new
-
-    # ── Initial conditions ──────────────────────────────────────────────────
-
-    def set_initial_conditions(self, u0=None, v0=None, init_type="random", seed=42):
         rng = np.random.default_rng(seed)
         shape = (self.resx, self.resy)
         x = self.px
         y = self.py
 
-        if u0 is not None and v0 is not None:
-            self.u = np.asarray(u0).astype(self.dtype, copy=False)
-            self.v = np.asarray(v0).astype(self.dtype, copy=False)
+        if (u0 is not None) and (v0 is not None):
+            u0 = np.asarray(u0, dtype=np.float64)
+            v0 = np.asarray(v0, dtype=np.float64)
+            if u0.shape != shape or v0.shape != shape:
+                raise ValueError(f"Custom u0/v0 must have shape {shape}, got {u0.shape} and {v0.shape}.")
+            self.u = u0
+            self.v = v0
             return
 
         if init_type == "random":
-            self.u = (0.1 * rng.standard_normal(shape)).astype(self.dtype)
-            self.v = (0.1 * rng.standard_normal(shape)).astype(self.dtype)
-
-        elif init_type == "zeros":
-            self.u = np.zeros(shape)
-            self.v = np.zeros(shape)
+            self.u = 0.1 * rng.standard_normal(shape)
+            #self.u = -1 + 0.1 * rng.standard_normal(shape)
+            self.v = 0.1 * rng.standard_normal(shape)
 
         elif init_type == "pulse":
             cx, cy = self.sizex / 2, self.sizey / 2
             r2 = (x - cx) ** 2 + (y - cy) ** 2
-            self.u = np.exp(-r2 / 5.0).astype(self.dtype)
+            self.u = np.exp(-r2 / 5.0)
             self.v = np.zeros_like(self.u)
+
         elif init_type == "front":
-            self.u = np.where(x < self.sizex / 2, 1.0, -1.0).astype(self.dtype)
+            self.u = np.where(x < self.sizex / 2, 1.0, -1.0)
             self.v = np.zeros_like(self.u)
+
         elif init_type == "sin":
             k = 2 * np.pi / self.sizex * 4
-            self.u = (0.1 * np.sin(k * x)).astype(self.dtype)
+            self.u = 0.1 * np.sin(k * x)
             self.v = np.zeros_like(self.u)
+
         elif init_type == "biased":
-            self.u = (0.5 + 0.1 * rng.standard_normal(shape)).astype(self.dtype)
-            self.v = (0.0 + 0.1 * rng.standard_normal(shape)).astype(self.dtype)
+            self.u = 0.5 + 0.1 * rng.standard_normal(shape)
+            self.v = 0.0 + 0.1 * rng.standard_normal(shape)
 
         elif init_type == "spiral_cg":
-            # Spiral-seeding IC (cross-gradient):
-            # u has an x-gradient, v has a y-gradient. This creates a phase defect near the center.
             cx, cy = self.sizex / 2, self.sizey / 2
-            A = 0.02  # try 0.005 ~ 0.05 depending on parameters
+            A = 0.02
             self.u = A * (x - cx)
             self.v = A * (y - cy)
 
         elif init_type == "spiral_bw":
-            # Spiral-seeding IC (broken wavefront):
-            # Left half is excited; a notch breaks the front so the tips curl into a spiral.
-            self.u = np.zeros(shape)
-            self.v = np.zeros(shape)
-
-            # excite left half-plane
             self.u = np.where(x < self.sizex / 2, 1.0, 0.0)
-
-            # notch (gap) near the center to create wave tips
+            self.v = np.zeros_like(self.u)
             cx, cy = self.resx // 2, self.resy // 2
-            wx = max(2, self.resx // 50)  # notch half-width in x (grid units)
-            wy = max(6, self.resy // 10)  # notch half-height in y (grid units)
+            wx = max(2, self.resx // 50)
+            wy = max(6, self.resy // 10)
             self.u[cx - wx: cx + wx, cy - wy: cy + wy] = 0.0
 
         elif init_type == "spiral_pf":
-            # Spiral-seeding IC (phase field):
-            # u = u* + A cos(theta), v = v* + A sin(theta)
             cx, cy = self.sizex / 2, self.sizey / 2
             theta = np.arctan2(y - cy, x - cx)
-            A = 0.2  # try 0.05 ~ 0.5
+            A = 0.2
             self.u = A * np.cos(theta)
             self.v = A * np.sin(theta)
-
-            # excite left half-plane
             self.u = np.where(x < self.sizex / 2, 1.0, 0.0)
-
-            # notch (gap) near the center to create wave tips
-            cx, cy = self.resx // 2, self.resy // 2
-            wx = max(2, self.resx // 50)  # notch half-width in x (grid units)
-            wy = max(6, self.resy // 10)  # notch half-height in y (grid units)
-            self.u[cx - wx: cx + wx, cy - wy: cy + wy] = 0.0
+            cx_i, cy_i = self.resx // 2, self.resy // 2
+            wx = max(2, self.resx // 50)
+            wy = max(6, self.resy // 10)
+            self.u[cx_i - wx: cx_i + wx, cy_i - wy: cy_i + wy] = 0.0
 
         else:
             raise ValueError(f"Unknown init_type: {init_type}")
 
-    # ── Run loops ──────────────────────────────────────────────────────────
+        # Ensure float64
+        self.u = np.asarray(self.u, dtype=np.float64)
+        self.v = np.asarray(self.v, dtype=np.float64)
 
-    def _run_numpy(self, T: float):
-        if self.linear_mask_u is None:
+    # ── Run loop (JAX) ──────────────────────────────────────────────────────
+
+    def run(self, T: float) -> None:
+        """
+        Run the simulation for total time T, using a JIT-compiled JAX loop.
+
+        After completion, histories are stored as NumPy arrays:
+          self.u_history, self.v_history, self.t_history
+        """
+        if self._mask_u_j is None or self._k2_j is None or self._mp is None:
             self.BuildSpectralMasks()
-        if self.u is None:
+
+        if self.u is None or self.v is None:
             self.set_initial_conditions()
 
+        mp = self._mp
         n_steps = int(np.floor(T / self.dt))
         save_every = max(1, self.save_every)
-        n_saves = 1 + (n_steps // save_every)
 
-        u_hist = np.empty((n_saves, self.resx, self.resy), dtype=self.dtype)
-        v_hist = np.empty((n_saves, self.resx, self.resy), dtype=self.dtype)
-        t_hist = np.empty((n_saves,), dtype=np.float64)
+        if self.store_initial:
+            n_saves = 1 + (n_steps // save_every)
+        else:
+            n_saves = (n_steps // save_every)
 
-        u_hist[0] = self.u
-        v_hist[0] = self.v
-        t_hist[0] = 0.0
-
-        save_idx = 0
-        for step in range(1, n_steps + 1):
-            self.SpectralStep()
-            if step % save_every == 0:
-                save_idx += 1
-                u_hist[save_idx] = self.u
-                v_hist[save_idx] = self.v
-                t_hist[save_idx] = step * self.dt
-
-        self.u_history = u_hist
-        self.v_history = v_hist
-        self.t_history = t_hist
-
-    def _run_jax(self, T: float):
-        if self.linear_mask_u is None:
-            self.BuildSpectralMasks()
-        if self.u is None:
-            self.set_initial_conditions()
-
-        mp = self._model_params()
-        n_steps = int(np.floor(T / self.dt))
-        save_every = max(1, self.save_every)
-        n_saves = 1 + (n_steps // save_every)
-
-        # Work in float64 inside JAX
+        # Device arrays
         u = jnp.array(self.u, dtype=jnp.float64)
         v = jnp.array(self.v, dtype=jnp.float64)
 
+        # Preallocate histories on device
         u_hist = jnp.zeros((n_saves, self.resx, self.resy), dtype=jnp.float64)
         v_hist = jnp.zeros((n_saves, self.resx, self.resy), dtype=jnp.float64)
-        u_hist = u_hist.at[0].set(u)
-        v_hist = v_hist.at[0].set(v)
 
-        if self.jax_mode == "xla":
-            if self._mask_u_j is None or self._k2_j is None:
-                # ensure jax masks exist
-                self.backend = "jax"
-                self.BuildSpectralMasks()
-
-            step_kwargs = dict(
-                a=jnp.float64(mp.a),
-                b=jnp.float64(mp.b),
-                epsilon=jnp.float64(mp.epsilon),
-                dt=jnp.float64(self.dt),
-                k2=self._k2_j,
-                mask_u=self._mask_u_j,
-                mask_v=self._mask_v_j,
-                mass_conserved=bool(mp.mass_conserved),
-                dealias_mask=(self._dealias_mask_j if self.dealias else None),
-            )
-            step_fn = jax.jit(lambda uu, vv: self._jax_step_xla(uu, vv, **step_kwargs))
-            do_step = lambda uu, vv: step_fn(uu, vv)
+        # Store initial condition if requested
+        if self.store_initial:
+            u_hist = u_hist.at[0].set(u)
+            v_hist = v_hist.at[0].set(v)
+            start_step = 1
+            save_idx0 = jnp.int32(0)
         else:
-            # Route B: SciPy FFT callback (match NumPy)
-            # We still jit the loop body; callbacks execute on host.
-            do_step = lambda uu, vv: self._jax_step_scipy_callback(uu, vv)
+            start_step = 1
+            save_idx0 = jnp.int32(-1)  # first save will bump to 0
+
+        step_kwargs = dict(
+            a=jnp.float64(mp.a),
+            b=jnp.float64(mp.b),
+            epsilon=jnp.float64(mp.epsilon),
+            dt=jnp.float64(self.dt),
+            k2=self._k2_j,
+            mask_u=self._mask_u_j,
+            mask_v=self._mask_v_j,
+            mass_conserved=bool(mp.mass_conserved),
+        )
+
+        step_fn = jax.jit(lambda uu, vv: FHNSimulation._jax_step(uu, vv, **step_kwargs))
 
         def body(step, carry):
             uu, vv, sidx, uh, vh = carry
-            uu, vv = do_step(uu, vv)
+            uu, vv = step_fn(uu, vv)
+
             do_save = (step % save_every) == 0
 
             def save_fn(args):
@@ -506,33 +359,32 @@ class FHNSimulation(Torus2D):
             return (uu, vv, sidx, uh, vh)
 
         uu, vv, sidx, u_hist, v_hist = lax.fori_loop(
-            1, n_steps + 1, body, (u, v, jnp.int32(0), u_hist, v_hist)
+            start_step, n_steps + 1, body, (u, v, save_idx0, u_hist, v_hist)
         )
 
-        # Host conversion (NumPy 2.0 safe)
-        self.u_history = np.asarray(jax.device_get(u_hist)).astype(self.dtype, copy=False)
-        self.v_history = np.asarray(jax.device_get(v_hist)).astype(self.dtype, copy=False)
+        # Move to host (NumPy), keep snapshot interface
+        self.u_history = np.asarray(jax.device_get(u_hist), dtype=np.float64)
+        self.v_history = np.asarray(jax.device_get(v_hist), dtype=np.float64)
 
-        t_hist = np.zeros((n_saves,), dtype=np.float64)
-        if n_saves > 1:
-            t_hist[1:] = (np.arange(1, n_saves) * save_every) * self.dt
-        self.t_history = t_hist
-
-        self.u = self.u_history[-1]
-        self.v = self.v_history[-1]
-
-    def run(self, T: float):
-        if self.backend == "numpy":
-            self._run_numpy(T)
+        # Build t_history on host (deterministic, lightweight)
+        self.t_history = np.zeros((n_saves,), dtype=np.float64)
+        if self.store_initial:
+            if n_saves > 1:
+                self.t_history[1:] = (np.arange(1, n_saves) * save_every) * self.dt
         else:
-            self._run_jax(T)
+            if n_saves > 0:
+                self.t_history[:] = (np.arange(1, n_saves + 1) * save_every) * self.dt
 
-        n_steps = int(np.floor(T / self.dt))
-        print(
-            f"Done: {self.model} | {n_steps} steps | backend={self.backend}"
-            f" | jax_mode={self.jax_mode if self.backend=='jax' else '-'}"
-            f" | dealias={self.dealias}"
-        )
+        # Update terminal state on host
+        self.u = self.u_history[-1].copy()
+        self.v = self.v_history[-1].copy()
 
-    def mass(self):
+        print(f"Done: {self.model} | {n_steps} steps | backend=jax | grid=Grid2D(DCT/Neumann)")
+
+    # ── Mass diagnostic ──────────────────────────────────────────────────────
+
+    def mass(self) -> np.ndarray:
+        """Total mass ∫∫u dA at each saved time step."""
+        if self.u_history is None:
+            return np.array([])
         return self.u_history.sum(axis=(1, 2)) * self.dx * self.dy

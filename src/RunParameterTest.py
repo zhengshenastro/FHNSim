@@ -11,9 +11,9 @@ warnings.filterwarnings("ignore")
 # INPUT PARAMETERS (edit ONLY this block)
 # ======================================================
 PARAMS = {
-    "a": 0.025,
+    "a": 0.05,
     "b": 1.26,
-    "eps": 0.5,
+    "eps": 0.1,
     "Du": 1.0,
     "Dv": 5.0,
 }

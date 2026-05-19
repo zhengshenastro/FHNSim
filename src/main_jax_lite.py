@@ -13,7 +13,7 @@ INIT_TYPE = "random"
 
 #Stationary Pattern
 
-PARAMS = dict(a=0.025, b=1.26, epsilon=0.5, Du=1.0, Dv=5.0)
+PARAMS = dict(a=0.025, b=1.26, epsilon=0.5, Du=0.5, Dv=5.0)
 #PARAMS = dict(a=-0.08, b=1.26, epsilon=.5, Du=1, Dv=5) #negative hexagon
 #PARAMS = dict(a=0.08, b=1.26, epsilon=.5, Du=1, Dv=5) #positive hexagon
 
@@ -26,7 +26,7 @@ PARAMS = dict(a=0.025, b=1.26, epsilon=0.5, Du=1.0, Dv=5.0)
 #spiral
 #PARAMS = dict(a=0.1, b=1, epsilon=.005, Du=1, Dv=1)
 GRID   = dict(sizex=50.0, sizey=50.0, resx=256, resy=256)
-T      = 10.0
+T      = 500.0
 n_snap = 49
 
 # ── Instantiate models ────────────────────────────────────────────────────────
@@ -53,8 +53,8 @@ conserved = MassConservedFHN(**PARAMS)
 #   np.float64 : recommended for stability and reproducibility
 #   np.float32 : faster and lower memory usage, but may introduce stronger
 #                numerical asymmetry / mode-selection artifacts in long runs
-sim_reg = FHNSimulation(regular, **GRID, dt=0.02, save_every=20)
-sim_mc  = FHNSimulation(conserved, **GRID, dt=0.02, save_every=20)
+sim_reg = FHNSimulation(regular, **GRID, dt=0.05, save_every=20)
+sim_mc  = FHNSimulation(conserved, **GRID, dt=0.05, save_every=20)
 
 
 sim_reg.set_initial_conditions(init_type=INIT_TYPE, seed=0)

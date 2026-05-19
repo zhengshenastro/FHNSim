@@ -26,20 +26,19 @@ from FHNmodel import RegularFHN, MassConservedFHN
 
 # JAX-only Neumann (DCT) simulation
 from Simulation_jax import FHNSimulation
-
 from Analyser import FHNAnalyser
 from Snapshots import plot_time_series_snapshots
 
 
 # ── Shared grid and time settings (MATCH uploaded main.py) ────────────────────
-GRID = dict(sizex=50.0, sizey=50.0, resx=256, resy=256)
-T, DT, SAVE_EVERY = 500.0, 0.05, 20
+GRID = dict(sizex=50.0, sizey=50.0, resx=128, resy=128)
+T, DT, SAVE_EVERY = 2000.0, 0.08, 20
 
 n_snap = 49  # number of frames in time-series snapshot grid
 
 # ── Base model parameters (MATCH uploaded main.py) ────────────────────────────
 
-PARAMS = dict(a=0.1, b=1.0, epsilon=0.005, Du=1.0, Dv=1.0)
+PARAMS = dict(a=0.025, b=1.26, epsilon=0.5, Du=1.0, Dv=5.0)
 #Stationary Pattern
 #PARAMS = dict(a=-0.08, b=1.26, epsilon=.5, Du=1, Dv=5) #negative hexagon
 #PARAMS = dict(a=0.08, b=1.26, epsilon=.05, Du=1, Dv=5) #positive hexagon
@@ -107,7 +106,7 @@ ana_mc  = FHNAnalyser(sim_mc)
 T_SWEEP = 2001.0
 
 print("\nRunning Regular FHN Du sweep...")
-reg_Du_values = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+reg_Du_values = [0.1, 0.2, 0.4, 0.8, 1.0]
 reg_sweep = []
 for Du in reg_Du_values:
     params = {**PARAMS, "Du": Du}
@@ -115,7 +114,7 @@ for Du in reg_Du_values:
     reg_sweep.append({"param_value": Du, "sim": s, "label": f"Du = {Du}"})
 
 print("Running Mass-Conserved FHN Du sweep...")
-mc_Du_values = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+mc_Du_values = [0.1, 0.2, 0.4, 0.8, 1.0]
 mc_sweep = []
 for Du in mc_Du_values:
     params = {**PARAMS, "Du": Du}
